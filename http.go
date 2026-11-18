@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"net"
 	"strconv"
+	"sync"
 	"strings"
 	"time"
 )
@@ -119,10 +120,23 @@ func decodePath(s string) string {
 }
 
 // response is one HTTP response, written in a single Write call.
+// headers is a fixed array (never more than Content-Type + 3 extras),
+// and the request id travels as a number: formatting "forge-N" happens
+// inline in writeResponse, so no per-response string or slice is
+// allocated for the two headers every reply carries.
 type response struct {
-	status  int
-	headers [][2]string
-	body    []byte
+	status   int
+	reqID    uint64
+	headers  [4][2]string
+	nheaders int
+	body     []byte
+}
+
+func (r *response) addHeader(k, v string) {
+	if r.nheaders < len(r.headers) {
+		r.headers[r.nheaders] = [2]string{k, v}
+		r.nheaders++
+	}
 }
 
 func statusText(code int) string {
@@ -178,7 +192,10 @@ func (s *server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	// The trial pod kills us at 900 s; a generous idle timeout keeps
 	// abandoned keep-alive connections from piling up goroutines.
-	br := bufio.NewReaderSize(conn, 65536)
+	// 8 KiB is plenty for request lines + headers (bodies are read
+	// into their own slices); 64 KiB per connection was pure GC load
+	// on the 50-concurrent-clone workload.
+	br := bufio.NewReaderSize(conn, 8192)
 	for {
 		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		req, err := readRequest(br)
@@ -196,69 +213,153 @@ func (s *server) handleConn(conn net.Conn) {
 	}
 }
 
+// readLine reads one \n-terminated line from br without allocating
+// when it fits the buffer: the slice borrows br's buffer and is only
+// valid until the next read, so callers must copy anything they keep.
+func readLine(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == bufio.ErrBufferFull {
+		// Over-long line: accumulate (rare; headers are short).
+		buf := append([]byte(nil), line...)
+		for err == bufio.ErrBufferFull {
+			line, err = br.ReadSlice('\n')
+			buf = append(buf, line...)
+		}
+		return buf, err
+	}
+	return line, err
+}
+
+// trimLine drops trailing \r and \n bytes (in place, no allocation).
+func trimLine(b []byte) []byte {
+	for len(b) > 0 && (b[len(b)-1] == '\r' || b[len(b)-1] == '\n') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// trimSpaces drops leading/trailing spaces and tabs (in place).
+func trimSpaces(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// headerKeyIs reports whether k (a raw header name) equals want
+// (lower-case) without allocating.
+func headerKeyIs(k []byte, want string) bool {
+	if len(k) != len(want) {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// containsFoldFold reports whether v contains needle, case-insensitively.
+func containsFold(v []byte, needle string) bool {
+	if len(needle) == 0 || len(v) < len(needle) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(v); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			c := v[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // readRequest parses one request from br (headers + body).
 func readRequest(br *bufio.Reader) (*request, error) {
-	line, err := br.ReadString('\n')
+	line, err := readLine(br)
 	if err != nil {
 		return nil, err
 	}
-	line = strings.TrimRight(line, "\r\n")
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	line = trimLine(line)
+	sp1 := bytes.IndexByte(line, ' ')
+	sp2 := -1
+	if sp1 >= 0 {
+		sp2 = bytes.IndexByte(line[sp1+1:], ' ')
+		if sp2 >= 0 {
+			sp2 += sp1 + 1
+		}
+	}
+	if sp1 < 0 || sp2 < 0 {
 		return nil, errBadRequest
 	}
 	req := &request{
-		method:    parts[0],
+		method:    string(line[:sp1]),
 		keepAlive: true, // HTTP/1.1 default
 	}
-	rawTarget := parts[1]
-	if i := strings.IndexByte(rawTarget, '?'); i >= 0 {
-		req.rawPath = rawTarget[:i]
-		req.query = rawTarget[i+1:]
+	rawTarget := line[sp1+1 : sp2]
+	if i := bytes.IndexByte(rawTarget, '?'); i >= 0 {
+		req.rawPath = string(rawTarget[:i])
+		req.query = string(rawTarget[i+1:])
 	} else {
-		req.rawPath = rawTarget
+		req.rawPath = string(rawTarget)
 	}
 	req.path = decodePathSegments(req.rawPath)
-	if strings.HasPrefix(parts[2], "HTTP/1.0") {
+	if bytes.HasPrefix(line[sp2+1:], []byte("HTTP/1.0")) {
 		req.keepAlive = false
 	}
 	var contentLength int = -1
 	chunked := false
 	for {
-		h, err := br.ReadString('\n')
+		h, err := readLine(br)
 		if err != nil {
 			return nil, err
 		}
-		h = strings.TrimRight(h, "\r\n")
-		if h == "" {
+		h = trimLine(h)
+		if len(h) == 0 {
 			break
 		}
-		k, v, ok := strings.Cut(h, ":")
-		if !ok {
+		colon := bytes.IndexByte(h, ':')
+		if colon < 0 {
 			continue
 		}
-		key := strings.ToLower(strings.TrimSpace(k))
-		val := strings.TrimSpace(v)
-		switch key {
-		case "content-length":
-			contentLength, _ = strconv.Atoi(val)
-		case "transfer-encoding":
-			if strings.Contains(strings.ToLower(val), "chunked") {
+		key := trimSpaces(h[:colon])
+		val := trimSpaces(h[colon+1:])
+		switch {
+		case headerKeyIs(key, "content-length"):
+			contentLength, _ = strconv.Atoi(string(val))
+		case headerKeyIs(key, "transfer-encoding"):
+			if containsFold(val, "chunked") {
 				chunked = true
 			}
-		case "connection":
-			lv := strings.ToLower(val)
-			if strings.Contains(lv, "close") {
+		case headerKeyIs(key, "connection"):
+			if containsFold(val, "close") {
 				req.keepAlive = false
-			} else if strings.Contains(lv, "keep-alive") {
+			} else if containsFold(val, "keep-alive") {
 				req.keepAlive = true
 			}
-		case "host":
-			req.host = val
-		case "authorization":
-			req.auth = val
-		case "git-protocol":
-			req.gitProtocol = val
+		case headerKeyIs(key, "host"):
+			req.host = string(val)
+		case headerKeyIs(key, "authorization"):
+			req.auth = string(val)
+		case headerKeyIs(key, "git-protocol"):
+			req.gitProtocol = string(val)
 		}
 	}
 	if chunked {
@@ -307,26 +408,26 @@ func readFull(br *bufio.Reader, b []byte) (int, error) {
 func readChunked(br *bufio.Reader) ([]byte, error) {
 	var out []byte
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLine(br)
 		if err != nil {
 			return nil, err
 		}
-		line = strings.TrimSpace(line)
-		if i := strings.IndexByte(line, ';'); i >= 0 {
+		line = trimSpaces(trimLine(line))
+		if i := bytes.IndexByte(line, ';'); i >= 0 {
 			line = line[:i]
 		}
-		n, err := strconv.ParseInt(line, 16, 64)
+		n, err := strconv.ParseInt(string(line), 16, 64)
 		if err != nil || n < 0 || n > 64<<20 {
 			return nil, errBadRequest
 		}
 		if n == 0 {
 			// Trailer headers until a blank line.
 			for {
-				t, err := br.ReadString('\n')
+				t, err := readLine(br)
 				if err != nil {
 					return nil, err
 				}
-				if strings.TrimRight(t, "\r\n") == "" {
+				if len(trimLine(t)) == 0 {
 					return out, nil
 				}
 			}
@@ -337,7 +438,7 @@ func readChunked(br *bufio.Reader) ([]byte, error) {
 		}
 		out = append(out, chunk...)
 		// Trailing CRLF after the chunk.
-		if _, err := br.ReadString('\n'); err != nil {
+		if _, err := readLine(br); err != nil {
 			return nil, err
 		}
 		if len(out) > 64<<20 {
@@ -352,43 +453,59 @@ func (e httpError) Error() string { return string(e) }
 
 const errBadRequest = httpError("bad request")
 
+// headerPool reuses response-header buffers: a fresh bytes.Buffer
+// grows through 2-3 allocations per response; a pooled 256-byte
+// buffer covers every header we emit.
+var headerPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
+
 // writeResponse serializes one response in a single Write.
 func writeResponse(conn net.Conn, req *request, resp *response) error {
-	var b bytes.Buffer
-	b.WriteString("HTTP/1.1 ")
-	b.WriteString(strconv.Itoa(resp.status))
-	b.WriteByte(' ')
-	b.WriteString(statusText(resp.status))
-	b.WriteString("\r\n")
-	for _, h := range resp.headers {
-		b.WriteString(h[0])
-		b.WriteString(": ")
-		b.WriteString(h[1])
-		b.WriteString("\r\n")
+	bp := headerPool.Get().(*[]byte)
+	b := (*bp)[:0]
+	b = append(b, "HTTP/1.1 "...)
+	b = strconv.AppendInt(b, int64(resp.status), 10)
+	b = append(b, ' ')
+	b = append(b, statusText(resp.status)...)
+	b = append(b, "\r\n"...)
+	b = append(b, "X-GitHub-Request-Id: forge-"...)
+	b = strconv.AppendUint(b, resp.reqID, 10)
+	b = append(b, "\r\n"...)
+	for _, h := range resp.headers[:resp.nheaders] {
+		b = append(b, h[0]...)
+		b = append(b, ": "...)
+		b = append(b, h[1]...)
+		b = append(b, "\r\n"...)
 	}
-	b.WriteString("Content-Length: ")
-	b.WriteString(strconv.Itoa(len(resp.body)))
-	b.WriteString("\r\n")
+	b = append(b, "Content-Length: "...)
+	b = strconv.AppendInt(b, int64(len(resp.body)), 10)
+	b = append(b, "\r\n"...)
 	if !req.keepAlive {
-		b.WriteString("Connection: close\r\n")
+		b = append(b, "Connection: close\r\n"...)
 	}
-	b.WriteString("\r\n")
+	b = append(b, "\r\n"...)
 	// One writev of headers + body: no copy of the body (a clone
 	// response can be hundreds of KiB).
-	nb := net.Buffers{b.Bytes(), resp.body}
+	nb := net.Buffers{b, resp.body}
 	_, err := nb.WriteTo(conn)
+	*bp = b[:0]
+	headerPool.Put(bp)
 	return err
 }
 
 // --- response constructors (every reply carries X-GitHub-Request-Id) ---
 
 func (s *server) jsonResp(status int, body []byte, extra ...[2]string) *response {
-	h := [][2]string{
-		{"Content-Type", "application/json"},
-		{"X-GitHub-Request-Id", s.store.nextRequestID()},
+	r := &response{status: status, reqID: s.store.nextRequestSeq(), body: body}
+	r.addHeader("Content-Type", "application/json")
+	for _, e := range extra {
+		r.addHeader(e[0], e[1])
 	}
-	h = append(h, extra...)
-	return &response{status: status, headers: h, body: body}
+	return r
 }
 
 func (s *server) jsonErr(status int, msg string) *response {
@@ -398,13 +515,9 @@ func (s *server) jsonErr(status int, msg string) *response {
 }
 
 func (s *server) emptyResp(status int) *response {
-	return &response{
-		status: status,
-		headers: [][2]string{
-			{"Content-Type", "application/json"},
-			{"X-GitHub-Request-Id", s.store.nextRequestID()},
-		},
-	}
+	r := &response{status: status, reqID: s.store.nextRequestSeq()}
+	r.addHeader("Content-Type", "application/json")
+	return r
 }
 
 // authed reports whether the request carries the expected bearer token.

@@ -307,10 +307,11 @@ func (s *Store) deleteRepo(name string) bool {
 	return true
 }
 
-// nextRequestID mints the next X-GitHub-Request-Id value.
-func (s *Store) nextRequestID() string {
+// nextRequestSeq mints the next X-GitHub-Request-Id sequence number;
+// writeResponse formats it as "forge-N" inline (no string allocated).
+func (s *Store) nextRequestSeq() uint64 {
 	s.reqSeq++
-	return "forge-" + strconv.FormatUint(s.reqSeq, 10)
+	return s.reqSeq
 }
 
 // --- global (Relay) ids: opaque, stable, resolvable across surfaces ---

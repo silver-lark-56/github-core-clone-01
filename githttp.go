@@ -127,14 +127,9 @@ func gitPath(p string) (owner, repo, service string, ok bool) {
 
 // gitResp builds a git response with the right content type.
 func (s *server) gitResp(status int, contentType string, body []byte) *response {
-	return &response{
-		status: status,
-		headers: [][2]string{
-			{"Content-Type", contentType},
-			{"X-GitHub-Request-Id", s.store.nextRequestID()},
-		},
-		body: body,
-	}
+	r := &response{status: status, reqID: s.store.nextRequestSeq(), body: body}
+	r.addHeader("Content-Type", contentType)
+	return r
 }
 
 func (s *server) handleGit(req *request) *response {

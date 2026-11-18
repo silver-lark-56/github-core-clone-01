@@ -359,6 +359,20 @@ func (r *Repo) isAncestorOf(anc, desc Oid) bool {
 	if anc == desc {
 		return true
 	}
+	// Fast path: the common case is a direct parent (a linear push
+	// chain). It avoids the map + stack allocation of the full walk.
+	// No recursion: a cyclic commit graph must still terminate in
+	// the `seen`-guarded walk below.
+	if o := r.objects[desc]; o != nil && o.typ == objCommit {
+		_, parents, _, ok := parseCommit(o.data)
+		if ok {
+			for _, p := range parents {
+				if p == anc {
+					return true
+				}
+			}
+		}
+	}
 	seen := make(map[Oid]bool)
 	stack := []Oid{desc}
 	for len(stack) > 0 {
@@ -935,6 +949,12 @@ func readOffset(b []byte, pos int) (off int, used int, ok bool) {
 // number of input bytes consumed. bytes.Reader implements io.ByteReader,
 // so the zlib/flate readers consume exactly the stream's bytes and the
 // remainder length is exact.
+//
+// NOTE (v4): pooling flate readers was tried and REVERTED — it measured
+// no gain (970 ms vs 935 ms exact CPU for the fixed workload), and the
+// first version of it panicked at runtime (a wrong interface assertion:
+// *flate.decompressor has no ReadByte) which dispatch's recover turned
+// into 500s on every push. Fresh zlib.NewReader per object stays.
 func inflate(b []byte, size uint64) ([]byte, int, error) {
 	if size > 64<<20 {
 		return nil, 0, errPack

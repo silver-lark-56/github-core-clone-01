@@ -11,6 +11,7 @@ package main
 import (
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ func main() {
 }
 
 func run() int {
+	// The live heap is tiny (a few MB of objects); the per-request
+	// garbage is short-lived. A higher GC target trades a little
+	// memory for measurably fewer GC cycles on a CPU-starved trial.
+	debug.SetGCPercent(300)
 	envURL := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
 	nowMs := parseTrialNow(os.Getenv("MAKEFUN_TRIAL_NOW"))
